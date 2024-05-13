@@ -1,9 +1,45 @@
 import argparse
-import os
-from multiprocessing import Pool
-import subprocess
+import csv
 import glob
+import io
+import itertools
+import os
+import subprocess
+from multiprocessing import Pool
+
+import cv2
 import tqdm
+
+
+def condition_continuous(x):
+    ix = iter(x)
+    pv = next(ix)
+    for v in ix:
+        assert pv + 1 == v
+        pv = v
+
+
+def condition_increase(x):
+    ix = iter(x)
+    pv = next(ix)
+    for v in ix:
+        assert pv < v
+        pv = v
+
+
+def condition_find_video(download_dir, video_id):
+    pattern = os.path.join(download_dir, f"{video_id}.*")
+    files = glob.glob(pattern)
+    return len(files) > 0
+
+
+def find_video_file(download_dir, video_id):
+    video_extensions = ["mp4", "avi", "mov", "mkv", "webm"]
+    for ext in video_extensions:
+        path = os.path.join(download_dir, f"{video_id}.{ext}")
+        if os.path.exists(path):
+            return path
+    return None
 
 
 def download_video(video_id, download_dir, logging=False):
@@ -30,11 +66,108 @@ def download_video(video_id, download_dir, logging=False):
     return success
 
 
-def process_video(video_id, output_dir, skip_exist, logging):
+def collect_clip_info(file_path):
+    """
+    Collects clipping frame information from a given text file.
+
+    :param file_path: Path to the text file containing frame data.
+    :return: Dictionary containing video_id and a list of frames with their properties.
+    """
+    clip_info = {}
+
+    try:
+        with open(file_path, "r") as file:
+            meta, frame, *_ = file.read().split("\n\n")
+
+        for line in meta.split("\n"):
+            k, v = line.split(":")
+            clip_info[k] = v.strip()
+
+        f = io.StringIO(frame.replace(" \t", ",").replace(" \n", "\n"))
+        csv_reader = csv.reader(f)
+        header = next(csv_reader)
+        assert header == "FRAME X Y W H".split()
+        clip_info.update({k: list(map(t, v)) for k, v, t in zip(header, zip(*csv_reader), [int, float, float, float, float])})
+
+        # DUMMY CODE: Some files do not have third section
+        # f = io.StringIO(phoneme)
+        # csv_reader = csv.reader(f, delimiter=" ")
+        # header = next(csv_reader)
+        # assert header == "WORD START END ASDSCORE".split()
+        # clip_info.update({k:list(map(t, v)) for k, v, t in zip(header, zip(*csv_reader), [str, float, float, float])})
+
+    except Exception as e:
+        print(f"Error processing the file {file_path}: {e}")
+
+    return clip_info
+
+
+def process_video(video_id, clip_dir, output_dir, skip_exist, logging, fps):
     download_dir = os.path.join(output_dir, "_videos_raw")
-    if skip_exist and os.path.exists(os.path.join(download_dir, f"{video_id}.*")):
-        return True
-    return download_video(video_id, download_dir, logging)
+    video_path = find_video_file(download_dir, video_id)
+    if not skip_exist or video_path is None:
+        success = download_video(video_id, download_dir, logging)
+        if not success:
+            raise Exception(f"fail to download {video_id}")
+        video_path = find_video_file(download_dir, video_id)
+
+    clip_infos = {}
+    for path in sorted(glob.glob(os.path.join(clip_dir, "*.txt"))):
+        clip_id, _ = os.path.splitext(os.path.basename(path))
+        clip_info = collect_clip_info(path)
+        clip_infos[clip_id] = clip_info
+        condition_continuous(clip_info["FRAME"])
+    condition_continuous(map(int, clip_infos.keys()))
+    condition_increase(map(lambda x: x["FRAME"][0], clip_infos.values()))
+
+    clip_iter = iter(clip_infos.items())
+    clip_id, clip_info = next(clip_iter)
+    clip_frames = []
+
+    cap = cv2.VideoCapture(video_path)
+
+    # DUMMY CODE: some video response as it have 0 frames
+    # frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    # assert list(clip_infos.values())[-1]["FRAME"][-1] < frame_count
+
+    frame_rate = cap.get(cv2.CAP_PROP_FPS)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    frames = itertools.takewhile(lambda ret_frame: ret_frame[0], (cap.read() for _ in itertools.count()))
+    for frame_raw_id, (_, frame) in enumerate(frames):
+        i = int(frame_raw_id * fps // frame_rate)
+        if clip_info["FRAME"][-1] < i:
+            clip = next(clip_iter, None)
+            if clip is None:
+                break
+            clip_id, clip_info = clip
+            clip_frames = []
+        elif clip_info["FRAME"][0] <= i:
+            rel_i = i - clip_info["FRAME"][0]
+            height, width, _ = frame.shape
+            X, Y, W, H = map(lambda x: clip_info[x][rel_i], "XYWH")
+            cropped_frame = frame[int(Y * height) : int((Y + H) * height), int(X * width) : int((X + W) * width)]
+            clip_frames.append(cropped_frame)
+
+        if clip_info["FRAME"][0] == i:
+            start_time = frame_raw_id / frame_rate
+        if i == clip_info["FRAME"][-1]:
+            end_time = (frame_raw_id + 1) / frame_rate
+
+            height = max(frame.shape[0] for frame in clip_frames)
+            width = max(frame.shape[1] for frame in clip_frames)
+            vonly_path = os.path.join(output_dir, f"{video_id}_{clip_id}_video.mp4")
+            aonly_path = os.path.join(output_dir, f"{video_id}_{clip_id}.aac")
+            final_path = os.path.join(output_dir, f"{video_id}_{clip_id}.mp4")
+            out = cv2.VideoWriter(vonly_path, fourcc, frame_rate, (width, height))
+            for frame in clip_frames:
+                resized = cv2.resize(frame, (width, height), interpolation=cv2.INTER_CUBIC)
+                out.write(resized)
+            out.release()
+            assert 0 == subprocess.call(f"ffmpeg -i {video_path} -ss {start_time} -to {end_time} -vn -acodec copy {aonly_path}", shell=True)
+            assert 0 == subprocess.call(f"ffmpeg -i {vonly_path} -i {aonly_path} -c:v copy -c:a copy -shortest {final_path}", shell=True)
+            os.remove(vonly_path)
+            os.remove(aonly_path)
+    cap.release()
 
 
 def process_video_wrapper(kwargs):
@@ -49,14 +182,16 @@ def collect_video_info(base_dir):
     return video_ids
 
 
-def process_dataset(source_dir, output_dir, num_workers, skip_exist):
+def process_dataset(source_dir, output_dir, num_workers, skip_exist, fps):
     video_infos = collect_video_info(source_dir)
     task_kwargs = [
         dict(
             video_id=video_id,
+            clip_dir=os.path.join(source_dir, path, video_id),
             output_dir=os.path.join(output_dir, path),
             skip_exist=skip_exist,
             logging=True,
+            fps=fps,
         )
         for path, video_id in video_infos
     ]
@@ -74,6 +209,7 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output_dir", type=str, required=True, help="Where to save the videos?")
     parser.add_argument("-w", "--num_workers", type=int, default=8, help="Number of workers for downloading")
     parser.add_argument("-skip", "--skip_exist", action="store_true", help="Skip downloading if file already exists")
+    parser.add_argument("--fps", type=int, default=25, help="dataset reference fps")
     args = parser.parse_args()
 
-    process_dataset(args.source_dir, args.output_dir, args.num_workers, args.skip_exist)
+    process_dataset(args.source_dir, args.output_dir, args.num_workers, args.skip_exist, args.fps)
