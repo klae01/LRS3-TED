@@ -204,12 +204,12 @@ def process_dataset(source_dir, output_dir, num_workers, skip_exist, fps):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Download LRS3-TED dataset")
-    parser.add_argument("-s", "--source_dir", type=str, required=True, help="Path to the directory with the dataset")
-    parser.add_argument("-o", "--output_dir", type=str, required=True, help="Where to save the videos?")
-    parser.add_argument("-w", "--num_workers", type=int, default=8, help="Number of workers for downloading")
-    parser.add_argument("-skip", "--skip_exist", action="store_true", help="Skip downloading if file already exists")
-    parser.add_argument("--fps", type=int, default=25, help="dataset reference fps")
+    parser = argparse.ArgumentParser(description="Script to download and process videos for the LRS3-TED dataset.")
+    parser.add_argument("--source-dir", type=str, required=True, help="Directory containing the dataset's raw files.")
+    parser.add_argument("--output-dir", type=str, required=True, help="Directory to save processed videos and metadata.")
+    parser.add_argument("--num-workers", type=int, default=8, help="Number of parallel workers for processing the dataset.")
+    parser.add_argument("--skip-exist", action="store_true", help="Skip processing videos that already exist in the output directory.")
+    parser.add_argument("--fps", type=int, default=25, help="Frames per second to use as reference for video processing.")
     args = parser.parse_args()
 
     process_dataset(args.source_dir, args.output_dir, args.num_workers, args.skip_exist, args.fps)
